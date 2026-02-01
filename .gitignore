@@ -11,3 +11,6 @@ wheels/
 
 # Environment variables
 .env
+
+# Google OAuth credentials
+client_secret*.json
