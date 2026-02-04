@@ -1205,4 +1205,11 @@ def handle_image_message(event):
 if __name__ == "__main__":
     # Use PORT environment variable for Zeabur/Railway, default to 8000 for local
     port = int(os.getenv("PORT", 8000))
+    print(f"=" * 50)
+    print(f"Starting LINE Bot Secretary on port {port}")
+    print(f"Environment check:")
+    print(f"  LINE_CHANNEL_ACCESS_TOKEN: {'✓' if os.getenv('LINE_CHANNEL_ACCESS_TOKEN') else '✗ MISSING'}")
+    print(f"  NOTION_TOKEN: {'✓' if os.getenv('NOTION_TOKEN') else '✗ MISSING'}")
+    print(f"  GOOGLE_AI_API_KEY: {'✓' if os.getenv('GOOGLE_AI_API_KEY') else '✗ MISSING'}")
+    print(f"=" * 50)
     app.run(host="0.0.0.0", port=port, debug=False)
