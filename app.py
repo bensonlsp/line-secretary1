@@ -1203,4 +1203,6 @@ def handle_image_message(event):
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8000, debug=True)
+    # Use PORT environment variable for Zeabur/Railway, default to 8000 for local
+    port = int(os.getenv("PORT", 8000))
+    app.run(host="0.0.0.0", port=port, debug=False)
