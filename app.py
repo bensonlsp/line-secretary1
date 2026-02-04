@@ -1203,8 +1203,8 @@ def handle_image_message(event):
 
 
 if __name__ == "__main__":
-    # Use PORT environment variable for Zeabur/Railway, default to 8000 for local
-    port = int(os.getenv("PORT", 8000))
+    # Use PORT environment variable for Zeabur/Railway, default to 8080 for local
+    port = int(os.getenv("PORT", 8080))
     print(f"=" * 50)
     print(f"Starting LINE Bot Secretary on port {port}")
     print(f"Environment check:")
