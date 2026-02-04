@@ -3,6 +3,7 @@ import io
 import re
 import base64
 import json
+import random
 from datetime import datetime
 import requests
 from bs4 import BeautifulSoup
@@ -21,6 +22,7 @@ from linebot.v3.messaging import (
     MessagingApiBlob,
     ReplyMessageRequest,
     TextMessage,
+    ImageMessage,
 )
 from linebot.v3.webhooks import MessageEvent, TextMessageContent, AudioMessageContent, ImageMessageContent
 from linebot.v3.exceptions import InvalidSignatureError
@@ -41,6 +43,30 @@ notion_database_id = os.getenv("NOTION_DATABASE_ID")
 # Allowed LINE user IDs (whitelist)
 ALLOWED_LINE_USER_IDS = {"Uca76be212cf92a65ad706eac60503cc2"}
 UNAUTHORIZED_MESSAGE = "抱歉，這是私人 Line Bot，未授權的用戶無法使用。"
+
+# 20 art styles for random image generation
+ART_STYLES = [
+    "Impressionist painting style, soft brushstrokes, vibrant colors like Monet",
+    "Japanese anime style, cel-shaded, big expressive eyes",
+    "Cyberpunk neon style, futuristic, glowing lights, dark atmosphere",
+    "Watercolor illustration, soft edges, flowing colors, artistic",
+    "Pop art style like Andy Warhol, bold colors, comic-like",
+    "Studio Ghibli animation style, whimsical, detailed backgrounds",
+    "Oil painting Renaissance style, dramatic lighting, classical",
+    "Minimalist flat design, simple shapes, limited color palette",
+    "Steampunk Victorian style, brass gears, vintage machinery",
+    "Pixel art retro game style, 8-bit aesthetic, nostalgic",
+    "Art Nouveau style, flowing organic lines, decorative patterns",
+    "Vaporwave aesthetic, pastel colors, 80s retro, glitch effects",
+    "Chinese ink wash painting style, elegant brushwork, traditional",
+    "Surrealist style like Salvador Dali, dreamlike, impossible scenes",
+    "Low poly 3D style, geometric shapes, modern digital art",
+    "Ukiyo-e Japanese woodblock print style, bold outlines, flat colors",
+    "Gothic dark fantasy style, mysterious, dramatic shadows",
+    "Bauhaus geometric style, primary colors, functional design",
+    "Psychedelic 60s style, vibrant swirling patterns, trippy colors",
+    "Chibi kawaii style, cute exaggerated proportions, adorable",
+]
 
 
 def is_chinese_text(text: str) -> bool:
@@ -316,18 +342,110 @@ Respond in JSON format only:
     return json.loads(result_text)
 
 
-def save_image_to_notion(title: str, prompt: str, image_url: str, line_id: str = None):
-    """Save image entry to Notion with Image, Prompt, Type, Date, and lineID fields."""
+def transform_prompt_with_style(original_prompt: str, new_style: str) -> str:
+    """Transform the original prompt to use a new art style."""
+    response = openai_client.chat.completions.create(
+        model="google/gemini-2.5-flash",
+        messages=[
+            {
+                "role": "user",
+                "content": f"""Transform this image prompt to use a completely different art style.
+
+Original prompt:
+{original_prompt}
+
+New style to apply:
+{new_style}
+
+Requirements:
+1. Keep the main subject and composition from the original
+2. Replace ALL style-related descriptions with the new style
+3. Adapt lighting, colors, and mood to match the new style
+4. Keep the prompt concise but descriptive (under 200 words)
+5. Output ONLY the new prompt, no explanations
+
+New prompt:""",
+            }
+        ],
+    )
+    return response.choices[0].message.content.strip()
+
+
+def generate_new_image(prompt: str) -> tuple[str, str]:
+    """Generate a new image using Google Imagen 4.0. Returns (image_url, model_used) or raises exception."""
+
+    google_ai_key = os.getenv("GOOGLE_AI_API_KEY")
+
+    app.logger.info("Generating image with Imagen 4.0...")
+
+    response = requests.post(
+        f"https://generativelanguage.googleapis.com/v1beta/models/imagen-4.0-generate-001:predict?key={google_ai_key}",
+        headers={
+            "Content-Type": "application/json",
+        },
+        json={
+            "instances": [
+                {"prompt": prompt}
+            ],
+            "parameters": {
+                "sampleCount": 1
+            }
+        },
+        timeout=120,
+    )
+
+    if response.status_code != 200:
+        error_msg = response.text
+        app.logger.error(f"Imagen 4.0 API error: {error_msg}")
+        raise Exception(f"Imagen 4.0 生成失敗：{response.status_code} - {error_msg[:200]}")
+
+    result = response.json()
+    app.logger.info(f"Imagen 4.0 response: {json.dumps(result)[:500]}")
+
+    # Extract base64 image from response
+    if "predictions" in result and len(result["predictions"]) > 0:
+        prediction = result["predictions"][0]
+        if "bytesBase64Encoded" in prediction:
+            image_bytes = base64.b64decode(prediction["bytesBase64Encoded"])
+        elif "image" in prediction and "bytesBase64Encoded" in prediction["image"]:
+            image_bytes = base64.b64decode(prediction["image"]["bytesBase64Encoded"])
+        else:
+            raise Exception(f"無法從回應中提取圖片：{json.dumps(prediction)[:200]}")
+    else:
+        raise Exception(f"回應格式異常：{json.dumps(result)[:200]}")
+
+    # Upload to Google Drive
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"generated_{timestamp}.png"
+    image_url = upload_to_google_drive(image_bytes, filename)
+
+    return image_url, "Imagen 4.0"
+
+
+def download_image_from_url(url: str) -> bytes:
+    """Download image from URL and return bytes."""
+    response = requests.get(url, timeout=60)
+    response.raise_for_status()
+    return response.content
+
+
+def save_image_to_notion(title: str, prompt: str, image_url: str, line_id: str = None, generated_image_url: str = None, style_used: str = None, new_prompt: str = None):
+    """Save image entry to Notion with original and generated images."""
     today = datetime.now().strftime("%Y-%m-%d")
+
+    # Build image files list - include both original and generated if available
+    image_files = [{"type": "external", "name": f"{title} (原圖)", "external": {"url": image_url}}]
+    if generated_image_url:
+        image_files.append({"type": "external", "name": f"{title} (AI生成)", "external": {"url": generated_image_url}})
 
     page_data = {
         "parent": {"database_id": notion_database_id},
         "properties": {
             "Name": {"title": [{"text": {"content": title}}]},
-            "Image": {"files": [{"type": "external", "name": title, "external": {"url": image_url}}]},
+            "Image": {"files": image_files},
             "Prompt": {"rich_text": [{"text": {"content": prompt}}]},
-            "Content": {"rich_text": [{"text": {"content": ""}}]},
-            "Summary": {"rich_text": [{"text": {"content": ""}}]},
+            "Content": {"rich_text": [{"text": {"content": style_used or ""}}]},
+            "Summary": {"rich_text": [{"text": {"content": new_prompt or ""}}]},
             "Type": {"select": {"name": "圖片助手"}},
             "Date": {"date": {"start": today}},
         }
@@ -354,6 +472,123 @@ def detect_url(text: str) -> str | None:
     url_pattern = r'https?://[^\s<>"{}|\\^`\[\]]+'
     match = re.search(url_pattern, text)
     return match.group(0) if match else None
+
+
+def detect_social_platform(url: str) -> str | None:
+    """Detect if URL is from Facebook or Threads. Returns 'facebook', 'threads', or None."""
+    url_lower = url.lower()
+    if "facebook.com" in url_lower or "fb.com" in url_lower or "fb.watch" in url_lower:
+        return "facebook"
+    elif "threads.com" in url_lower or "threads.net" in url_lower:
+        return "threads"
+    return None
+
+
+def fetch_social_content_with_apify(url: str, platform: str) -> dict:
+    """Fetch social media content using Apify. Returns dict with title and content."""
+    apify_key = os.getenv("APIFY_API_KEY")
+    if not apify_key:
+        raise Exception("未設置 APIFY_API_KEY 環境變數")
+
+    # Select the appropriate Apify actor
+    if platform == "facebook":
+        actor_id = "apify/facebook-posts-scraper"
+    elif platform == "threads":
+        actor_id = "futurizerush/meta-threads-scraper"
+    else:
+        raise Exception(f"不支援的平台：{platform}")
+
+    app.logger.info(f"Fetching {platform} content with Apify actor: {actor_id}")
+
+    # Convert actor ID format from "user/actor" to "user~actor" for API
+    api_actor_id = actor_id.replace("/", "~")
+
+    # Run the Apify actor synchronously with standard input format
+    response = requests.post(
+        f"https://api.apify.com/v2/acts/{api_actor_id}/run-sync-get-dataset-items",
+        headers={
+            "Authorization": f"Bearer {apify_key}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "startUrls": [{"url": url}],
+            "maxResults": 1,
+        },
+        timeout=180,  # Longer timeout for all platforms
+    )
+
+    # Accept both 200 (OK) and 201 (Created) as success
+    if response.status_code not in [200, 201]:
+        error_msg = response.text
+        app.logger.error(f"Apify API error: {error_msg}")
+        raise Exception(f"Apify 爬取失敗：{response.status_code} - {error_msg[:200]}")
+
+    results = response.json()
+    app.logger.info(f"Apify response: {json.dumps(results)[:500]}")
+
+    if not results or len(results) == 0:
+        raise Exception("Apify 未能爬取到任何內容")
+
+    post = results[0]
+
+    # Extract content based on platform
+    if platform == "facebook":
+        # Get author name from user object
+        author_name = post.get("user", {}).get("name") or post.get("userName") or "某用戶"
+        title = f"{author_name}的Facebook貼文"
+        content = post.get("text") or post.get("message") or ""
+        if post.get("link"):
+            content += f"\n\n連結：{post.get('link')}"
+    elif platform == "threads":
+        # Get author username
+        author_username = post.get("ownerUsername") or post.get("username") or "某用戶"
+        title = f"{author_username}的Threads貼文"
+        content = post.get("text") or post.get("caption") or ""
+
+    return {"title": title, "content": content, "raw": post}
+
+
+def save_social_to_notion(title: str, summary: str, original_content: str, platform: str, line_id: str = None):
+    """Save social media content to Notion with platform-specific Type tag."""
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    # Set type based on platform
+    if platform == "facebook":
+        note_type = "Facebook"
+    elif platform == "threads":
+        note_type = "Threads"
+    else:
+        note_type = "社交媒體"
+
+    # Split content into chunks of 1900 characters (Notion limit is 2000)
+    chunks = [original_content[i:i+1900] for i in range(0, len(original_content), 1900)]
+
+    page_data = {
+        "parent": {"database_id": notion_database_id},
+        "properties": {
+            "Name": {"title": [{"text": {"content": title}}]},
+            "Content": {"rich_text": [{"text": {"content": ""}}]},
+            "Summary": {"rich_text": [{"text": {"content": summary}}]},
+            "Date": {"date": {"start": today}},
+            "Type": {"select": {"name": note_type}},
+        },
+        "children": [
+            {
+                "object": "block",
+                "type": "paragraph",
+                "paragraph": {
+                    "rich_text": [{"type": "text", "text": {"content": chunk}}]
+                }
+            }
+            for chunk in chunks
+        ] if chunks else []
+    }
+
+    # Add lineID if provided
+    if line_id:
+        page_data["properties"]["lineID"] = {"rich_text": [{"text": {"content": line_id}}]}
+
+    notion_client.pages.create(**page_data)
 
 
 def fetch_webpage_content(url: str) -> dict:
@@ -524,9 +759,25 @@ def summarize_webpage(content: str) -> str:
     return response.choices[0].message.content.strip()
 
 
+def clean_text_for_notion(text: str) -> str:
+    """Remove invalid Unicode characters that Notion can't handle."""
+    # Remove null bytes and other problematic control characters
+    cleaned = text.replace('\x00', '')
+    # Remove other control characters except newline, tab, carriage return
+    cleaned = ''.join(char for char in cleaned if ord(char) >= 32 or char in '\n\t\r')
+    # Ensure valid encoding
+    cleaned = cleaned.encode('utf-8', errors='ignore').decode('utf-8', errors='ignore')
+    return cleaned
+
+
 def save_webpage_to_notion(title: str, summary: str, original_content: str, line_id: str = None):
     """Save webpage summary to Notion with Type '網頁摘要' and lineID."""
     today = datetime.now().strftime("%Y-%m-%d")
+
+    # Clean text to remove invalid Unicode characters
+    title = clean_text_for_notion(title)
+    summary = clean_text_for_notion(summary)
+    original_content = clean_text_for_notion(original_content)
 
     # Split content into chunks of 1900 characters (Notion limit is 2000)
     chunks = [original_content[i:i+1900] for i in range(0, len(original_content), 1900)]
@@ -604,26 +855,69 @@ def handle_message(event):
             try:
                 app.logger.info(f"Detected URL: {detected_url}")
 
-                # Fetch webpage content
-                webpage = fetch_webpage_content(detected_url)
-                title = webpage["title"] or "無標題網頁"
-                content = webpage["content"]
-                app.logger.info(f"Fetched webpage: {title}, content length: {len(content)}")
-                app.logger.info(f"Content preview: {content[:200]}...")
+                # Check if it's a social media URL (Facebook or Threads)
+                social_platform = detect_social_platform(detected_url)
 
-                # Summarize content
-                summary = summarize_webpage(content)
-                app.logger.info(f"Generated summary: {summary[:100]}...")
+                if social_platform == "facebook":
+                    # Use Apify to fetch Facebook content
+                    app.logger.info(f"Detected Facebook URL, using Apify...")
+                    social_data = fetch_social_content_with_apify(detected_url, social_platform)
+                    title = social_data["title"]
+                    content = social_data["content"]
+                    app.logger.info(f"Fetched Facebook content: {title}, content length: {len(content)}")
 
-                # Save to Notion
-                save_webpage_to_notion(title=title, summary=summary, original_content=content, line_id=user_line_id)
+                    if not content:
+                        raise Exception("未能從貼文中提取到文字內容")
 
-                line_bot_api.reply_message_with_http_info(
-                    ReplyMessageRequest(
-                        reply_token=event.reply_token,
-                        messages=[TextMessage(text=f"✅ 已儲存到 Notion\n\n📌 標題：{title}\n\n📝 摘要：{summary}")],
+                    # Summarize content
+                    summary = summarize_webpage(content)
+                    app.logger.info(f"Generated summary: {summary[:100]}...")
+
+                    # Save to Notion with platform-specific tag
+                    save_social_to_notion(
+                        title=title,
+                        summary=summary,
+                        original_content=content,
+                        platform=social_platform,
+                        line_id=user_line_id
                     )
-                )
+
+                    line_bot_api.reply_message_with_http_info(
+                        ReplyMessageRequest(
+                            reply_token=event.reply_token,
+                            messages=[TextMessage(text=f"✅ 已儲存 Facebook 貼文到 Notion\n\n📌 來源：{title}\n\n📝 摘要：{summary}")],
+                        )
+                    )
+                elif social_platform == "threads":
+                    # Threads not yet supported
+                    app.logger.info(f"Detected Threads URL, but not yet supported")
+                    line_bot_api.reply_message_with_http_info(
+                        ReplyMessageRequest(
+                            reply_token=event.reply_token,
+                            messages=[TextMessage(text=f"抱歉，暫時還未支援 Threads 內容抓取。\n\n目前支援：\n✅ Facebook 貼文\n✅ 一般網頁")],
+                        )
+                    )
+                else:
+                    # Regular webpage - use existing logic
+                    webpage = fetch_webpage_content(detected_url)
+                    title = webpage["title"] or "無標題網頁"
+                    content = webpage["content"]
+                    app.logger.info(f"Fetched webpage: {title}, content length: {len(content)}")
+                    app.logger.info(f"Content preview: {content[:200]}...")
+
+                    # Summarize content
+                    summary = summarize_webpage(content)
+                    app.logger.info(f"Generated summary: {summary[:100]}...")
+
+                    # Save to Notion
+                    save_webpage_to_notion(title=title, summary=summary, original_content=content, line_id=user_line_id)
+
+                    line_bot_api.reply_message_with_http_info(
+                        ReplyMessageRequest(
+                            reply_token=event.reply_token,
+                            messages=[TextMessage(text=f"✅ 已儲存到 Notion\n\n📌 標題：{title}\n\n📝 摘要：{summary}")],
+                        )
+                    )
             except Exception as e:
                 app.logger.error(f"URL processing error: {str(e)}")
                 line_bot_api.reply_message_with_http_info(
@@ -811,9 +1105,9 @@ def handle_image_message(event):
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             filename = f"line_image_{timestamp}.jpg"
 
-            # 3. Upload to Google Drive
+            # 3. Upload original to Google Drive
             image_url = upload_to_google_drive(image_content, filename)
-            app.logger.info(f"Uploaded to Google Drive: {image_url}")
+            app.logger.info(f"Uploaded original to Google Drive: {image_url}")
 
             # 4. Base64 encode and analyze with AI
             image_base64 = base64.b64encode(image_content).decode("utf-8")
@@ -822,17 +1116,82 @@ def handle_image_message(event):
             prompt = result["prompt"]
             app.logger.info(f"Generated title: {title}, prompt: {prompt[:100]}...")
 
-            # 5. Save to Notion
-            save_image_to_notion(title=title, prompt=prompt, image_url=image_url, line_id=user_line_id)
+            # 5. Randomly select a new style and transform prompt
+            selected_style = random.choice(ART_STYLES)
+            app.logger.info(f"Selected style: {selected_style}")
+            new_prompt = transform_prompt_with_style(prompt, selected_style)
+            app.logger.info(f"Transformed prompt: {new_prompt[:100]}...")
 
-            # 6. Reply to user
-            prompt_preview = prompt[:100] + "..." if len(prompt) > 100 else prompt
-            line_bot_api.reply_message_with_http_info(
-                ReplyMessageRequest(
-                    reply_token=event.reply_token,
-                    messages=[TextMessage(text=f"✅ 已儲存到 Notion\n\n📌 標題：{title}\n\n🎨 Prompt：{prompt_preview}")],
+            # 6. Try to generate new image
+            style_name = selected_style.split(",")[0]
+            app.logger.info("Generating new image with AI...")
+
+            try:
+                generated_image_url, model_used = generate_new_image(new_prompt)
+                app.logger.info(f"Generated image URL: {generated_image_url}, model: {model_used}")
+
+                # Save both images to Notion
+                save_image_to_notion(
+                    title=title,
+                    prompt=prompt,
+                    image_url=image_url,
+                    line_id=user_line_id,
+                    generated_image_url=generated_image_url,
+                    style_used=selected_style,
+                    new_prompt=new_prompt
                 )
-            )
+
+                # Reply with success message and generated image
+                reply_text = f"""收到你張相啦！📸
+
+睇落係「{title}」嚟嘅～ 我已經幫你收藏咗去 Notion 喇！
+
+順便幫你用「{style_name}」風格重新繪製咗一張，希望你鍾意啦 🎨✨
+
+🤖 生成模型：{model_used}"""
+
+                line_bot_api.reply_message_with_http_info(
+                    ReplyMessageRequest(
+                        reply_token=event.reply_token,
+                        messages=[
+                            TextMessage(text=reply_text),
+                            ImageMessage(
+                                original_content_url=generated_image_url,
+                                preview_image_url=generated_image_url
+                            )
+                        ],
+                    )
+                )
+
+            except Exception as gen_error:
+                # Image generation failed, but still save original to Notion
+                app.logger.error(f"Image generation failed: {str(gen_error)}")
+
+                save_image_to_notion(
+                    title=title,
+                    prompt=prompt,
+                    image_url=image_url,
+                    line_id=user_line_id,
+                    style_used=selected_style,
+                    new_prompt=new_prompt
+                )
+
+                # Reply with partial success message
+                reply_text = f"""收到你張相啦！📸
+
+睇落係「{title}」嚟嘅～ 我已經幫你收藏咗去 Notion 喇！
+
+本來想幫你用「{style_name}」風格重新繪製，但係生成圖片時出咗啲問題 😅
+
+❌ 錯誤：{str(gen_error)[:150]}"""
+
+                line_bot_api.reply_message_with_http_info(
+                    ReplyMessageRequest(
+                        reply_token=event.reply_token,
+                        messages=[TextMessage(text=reply_text)],
+                    )
+                )
+
         except Exception as e:
             app.logger.error(f"Image processing error: {str(e)}")
             line_bot_api.reply_message_with_http_info(
